@@ -1,127 +1,141 @@
+using System;
 using System.Diagnostics;
+using System.Threading.Tasks;
 
-const int ArraySize = 100_000;
-const int MinValue = -10_000;
-const int MaxValue = 10_001;
-const int Seed = 20260619;
-
-int[] numbers = CreateArray(ArraySize, Seed, MinValue, MaxValue);
-
-// Прогрев JIT уменьшает влияние первой компиляции методов на сравнение.
-_ = CalculateSequential(numbers);
-_ = CalculateParallel(numbers);
-
-(Statistics sequential, double sequentialMs) = Measure(() => CalculateSequential(numbers));
-(Statistics parallel, double parallelMs) = Measure(() => CalculateParallel(numbers));
-
-Console.WriteLine("Статистика массива из 100 000 элементов");
-Console.WriteLine($"Диапазон значений: {MinValue}..{MaxValue - 1}; seed: {Seed}");
-Console.WriteLine();
-PrintResult("Обычный цикл", sequential, sequentialMs);
-PrintResult("Parallel.For", parallel, parallelMs);
-
-bool resultsMatch = sequential == parallel;
-Console.WriteLine($"Результаты совпадают: {(resultsMatch ? "да" : "нет")}");
-
-if (!resultsMatch)
+internal static class Program
 {
-    Environment.ExitCode = 1;
-    return;
-}
+    private const int ArraySize = 100000;
+    private const int MinValue = -10000;
+    private const int MaxValueExclusive = 10001;
+    private const int Seed = 20260619;
 
-double ratio = parallelMs == 0 ? 0 : sequentialMs / parallelMs;
-Console.WriteLine($"Отношение времени (обычный / Parallel.For): {ratio:F2}");
-Console.WriteLine("Примечание: на небольшом объёме данных Parallel.For может быть медленнее из-за накладных расходов.");
-
-static int[] CreateArray(int size, int seed, int minValue, int maxValue)
-{
-    var random = new Random(seed);
-    var data = new int[size];
-
-    for (int i = 0; i < data.Length; i++)
+    private static int Main()
     {
-        data[i] = random.Next(minValue, maxValue);
+        int[] numbers = CreateArray(ArraySize, Seed, MinValue, MaxValueExclusive);
+        CalculateSequential(numbers);
+        CalculateParallel(numbers);
+
+        TimedResult sequential = Measure(delegate { return CalculateSequential(numbers); });
+        TimedResult parallel = Measure(delegate { return CalculateParallel(numbers); });
+
+        Console.WriteLine("Статистика массива из 100 000 элементов");
+        Console.WriteLine("Диапазон значений: {0}..{1}; seed: {2}", MinValue, MaxValueExclusive - 1, Seed);
+        Console.WriteLine();
+        PrintResult("Обычный цикл", sequential);
+        PrintResult("Parallel.For", parallel);
+
+        bool resultsMatch = sequential.Statistics.Equals(parallel.Statistics);
+        Console.WriteLine("Результаты совпадают: {0}", resultsMatch ? "да" : "нет");
+        if (!resultsMatch) return 1;
+
+        double ratio = parallel.Milliseconds == 0 ? 0 : sequential.Milliseconds / parallel.Milliseconds;
+        Console.WriteLine("Отношение времени (обычный / Parallel.For): {0:F2}", ratio);
+        Console.WriteLine("Примечание: Parallel.For может быть медленнее из-за накладных расходов.");
+        return 0;
     }
 
-    return data;
-}
-
-static Statistics CalculateSequential(int[] data)
-{
-    long sum = 0;
-    int min = int.MaxValue;
-    int max = int.MinValue;
-
-    for (int i = 0; i < data.Length; i++)
+    private static int[] CreateArray(int size, int seed, int minValue, int maxValue)
     {
-        int value = data[i];
-        sum += value;
-        if (value < min) min = value;
-        if (value > max) max = value;
+        var random = new Random(seed);
+        var data = new int[size];
+        for (int i = 0; i < data.Length; i++) data[i] = random.Next(minValue, maxValue);
+        return data;
     }
 
-    return new Statistics(data.Length, sum, min, max);
-}
-
-static Statistics CalculateParallel(int[] data)
-{
-    object mergeLock = new();
-    long totalSum = 0;
-    int globalMin = int.MaxValue;
-    int globalMax = int.MinValue;
-
-    Parallel.For(
-        0,
-        data.Length,
-        () => new LocalStatistics(0, int.MaxValue, int.MinValue),
-        (index, _, local) =>
+    private static Statistics CalculateSequential(int[] data)
+    {
+        long sum = 0;
+        int min = int.MaxValue;
+        int max = int.MinValue;
+        for (int i = 0; i < data.Length; i++)
         {
-            int value = data[index];
-            local.Sum += value;
-            if (value < local.Min) local.Min = value;
-            if (value > local.Max) local.Max = value;
-            return local;
-        },
-        local =>
-        {
-            lock (mergeLock)
+            int value = data[i];
+            sum += value;
+            if (value < min) min = value;
+            if (value > max) max = value;
+        }
+        return new Statistics(data.Length, sum, min, max);
+    }
+
+    private static Statistics CalculateParallel(int[] data)
+    {
+        object mergeLock = new object();
+        long totalSum = 0;
+        int globalMin = int.MaxValue;
+        int globalMax = int.MinValue;
+
+        Parallel.For(
+            0,
+            data.Length,
+            delegate { return new LocalStatistics(0, int.MaxValue, int.MinValue); },
+            delegate(int index, ParallelLoopState state, LocalStatistics local)
             {
-                totalSum += local.Sum;
-                if (local.Min < globalMin) globalMin = local.Min;
-                if (local.Max > globalMax) globalMax = local.Max;
-            }
-        });
+                int value = data[index];
+                local.Sum += value;
+                if (value < local.Min) local.Min = value;
+                if (value > local.Max) local.Max = value;
+                return local;
+            },
+            delegate(LocalStatistics local)
+            {
+                lock (mergeLock)
+                {
+                    totalSum += local.Sum;
+                    if (local.Min < globalMin) globalMin = local.Min;
+                    if (local.Max > globalMax) globalMax = local.Max;
+                }
+            });
 
-    return new Statistics(data.Length, totalSum, globalMin, globalMax);
-}
+        return new Statistics(data.Length, totalSum, globalMin, globalMax);
+    }
 
-static (Statistics Result, double Milliseconds) Measure(Func<Statistics> action)
-{
-    var stopwatch = Stopwatch.StartNew();
-    Statistics result = action();
-    stopwatch.Stop();
-    return (result, stopwatch.Elapsed.TotalMilliseconds);
-}
+    private static TimedResult Measure(Func<Statistics> action)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        Statistics result = action();
+        stopwatch.Stop();
+        return new TimedResult(result, stopwatch.Elapsed.TotalMilliseconds);
+    }
 
-static void PrintResult(string title, Statistics stats, double milliseconds)
-{
-    Console.WriteLine(title);
-    Console.WriteLine($"  Минимум: {stats.Min}");
-    Console.WriteLine($"  Максимум: {stats.Max}");
-    Console.WriteLine($"  Сумма: {stats.Sum}");
-    Console.WriteLine($"  Среднее: {stats.Average:F3}");
-    Console.WriteLine($"  Время: {milliseconds:F3} мс");
-    Console.WriteLine();
-}
+    private static void PrintResult(string title, TimedResult result)
+    {
+        Statistics stats = result.Statistics;
+        Console.WriteLine(title);
+        Console.WriteLine("  Минимум: {0}", stats.Min);
+        Console.WriteLine("  Максимум: {0}", stats.Max);
+        Console.WriteLine("  Сумма: {0}", stats.Sum);
+        Console.WriteLine("  Среднее: {0:F3}", stats.Average);
+        Console.WriteLine("  Время: {0:F3} мс", result.Milliseconds);
+        Console.WriteLine();
+    }
 
-readonly record struct Statistics(int Count, long Sum, int Min, int Max)
-{
-    public double Average => Count == 0 ? 0 : (double)Sum / Count;
-}
+    private struct Statistics : IEquatable<Statistics>
+    {
+        public Statistics(int count, long sum, int min, int max)
+        { Count = count; Sum = sum; Min = min; Max = max; }
+        public readonly int Count;
+        public readonly long Sum;
+        public readonly int Min;
+        public readonly int Max;
+        public double Average { get { return Count == 0 ? 0 : (double)Sum / Count; } }
+        public bool Equals(Statistics other)
+        { return Count == other.Count && Sum == other.Sum && Min == other.Min && Max == other.Max; }
+    }
 
-struct LocalStatistics(long sum, int min, int max)
-{
-    public long Sum = sum;
-    public int Min = min;
-    public int Max = max;
+    private struct LocalStatistics
+    {
+        public LocalStatistics(long sum, int min, int max)
+        { Sum = sum; Min = min; Max = max; }
+        public long Sum;
+        public int Min;
+        public int Max;
+    }
+
+    private struct TimedResult
+    {
+        public TimedResult(Statistics statistics, double milliseconds)
+        { Statistics = statistics; Milliseconds = milliseconds; }
+        public readonly Statistics Statistics;
+        public readonly double Milliseconds;
+    }
 }
